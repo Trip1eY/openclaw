@@ -7,6 +7,7 @@ import { ensureSystemPromptCacheBoundary } from "@openclaw/ai/internal/shared";
 import { MAX_IMAGE_BYTES } from "@openclaw/media-core/constants";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { m10GatewayRequestId, observeM10GatewayStreamError } from "../../m10-gateway-boundary.js";
 import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
 import { buildHierarchyReinforcementMessage } from "../../../auto-reply/handoff-summarizer.js";
 import { filterHeartbeatTranscriptArtifacts } from "../../../auto-reply/heartbeat-filter.js";
@@ -506,6 +507,7 @@ import {
 import { resolveMessageMergeStrategy } from "./message-merge-strategy.js";
 import { installMessageToolOnlyTerminalHook } from "./message-tool-terminal.js";
 import { wrapStreamFnWithMessageTransform } from "./message-transform-stream-wrapper.js";
+import { wrapStreamObjectEvents } from "./stream-wrapper.js";
 import {
   MID_TURN_PRECHECK_ERROR_MESSAGE,
   isMidTurnPrecheckSignal,
@@ -3269,6 +3271,27 @@ export async function runEmbeddedAttempt(
             firstEventTimeoutMs: optionsWithFirstEvent?.firstEventTimeoutMs ?? firstEventTimeoutMs,
             onFirstEventTimeout: optionsWithFirstEvent?.onFirstEventTimeout ?? idleTimeoutTrigger,
           } as typeof options);
+        };
+      }
+      if (params.provider === "m10-gateway" && params.model.api === "openai-completions") {
+        const baseStreamFn = activeSession.agent.streamFn;
+        activeSession.agent.streamFn = (model, context, options) => {
+          const requestId = m10GatewayRequestId(params.runId);
+          const stream = baseStreamFn(model, context, requestId ? {
+            ...options,
+            headers: { ...options?.headers, "X-M10-Request-ID": requestId },
+          } : options);
+          if (requestId) {
+            wrapStreamObjectEvents(stream, (event) => {
+              if (event.type === "error" && event.error && typeof event.error === "object") {
+                observeM10GatewayStreamError(
+                  params.runId,
+                  (event.error as { errorMessage?: unknown }).errorMessage,
+                );
+              }
+            });
+          }
+          return stream;
         };
       }
       let diagnosticModelCallSeq = 0;

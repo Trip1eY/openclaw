@@ -9,6 +9,7 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { isClientToolNameConflictError } from "../agents/agent-tool-definition-adapter.js";
+import { registerM10GatewayRequest, type M10GatewayError } from "../agents/m10-gateway-boundary.js";
 import type { AgentStreamParams, ClientToolDefinition } from "../agents/command/shared-types.js";
 import type { ImageContent } from "../agents/command/types.js";
 import { STREAM_ERROR_FALLBACK_TEXT } from "../agents/stream-message-shared.js";
@@ -874,6 +875,15 @@ function resolveErrorMessage(err: unknown): string {
   return String(err);
 }
 
+function m10GatewayErrorPayload(error: M10GatewayError) {
+  return {
+    message: "upstream provider error",
+    type: "api_error",
+    layer: "gateway",
+    ...error,
+  };
+}
+
 export async function handleOpenAiHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1081,10 +1091,17 @@ export async function handleOpenAiHttpRequest(
 
   if (!stream) {
     const stopWatchingDisconnect = watchClientDisconnect(req, res, abortController);
+    const boundary = registerM10GatewayRequest(runId, req.headers["x-m10-request-id"], (error) => {
+      if (!res.writableEnded) {
+        sendJson(res, error.http_status, { error: m10GatewayErrorPayload(error) });
+        abortController.abort();
+      }
+    });
+    res.setHeader("X-M10-Request-ID", boundary.requestId);
     try {
       const result = await agentCommandFromIngress(commandInput, defaultRuntime, deps);
 
-      if (abortController.signal.aborted) {
+      if (abortController.signal.aborted || res.writableEnded) {
         return true;
       }
 
@@ -1154,7 +1171,7 @@ export async function handleOpenAiHttpRequest(
         usage,
       });
     } catch (err) {
-      if (abortController.signal.aborted) {
+      if (abortController.signal.aborted || res.writableEnded) {
         return true;
       }
       logWarn(`openai-compat: chat completion failed: ${String(err)}`);
@@ -1173,12 +1190,11 @@ export async function handleOpenAiHttpRequest(
         error: { message: "internal error", type: "api_error" },
       });
     } finally {
+      boundary.release();
       stopWatchingDisconnect();
     }
     return true;
   }
-
-  setSseHeaders(res);
 
   let wroteRole = false;
   let wroteStopChunk = false;
@@ -1285,6 +1301,19 @@ export async function handleOpenAiHttpRequest(
     closed = true;
     unsubscribe();
   });
+
+  const boundary = registerM10GatewayRequest(runId, req.headers["x-m10-request-id"], (error) => {
+    if (closed || res.writableEnded) { return; }
+    closed = true;
+    stopWatchingDisconnect();
+    unsubscribe();
+    writeSse(res, { error: m10GatewayErrorPayload(error) });
+    writeDone(res);
+    res.end();
+    abortController.abort();
+  });
+  res.setHeader("X-M10-Request-ID", boundary.requestId);
+  setSseHeaders(res);
 
   wroteRole = true;
   writeAssistantRoleChunk(res, { runId, model });
@@ -1423,6 +1452,7 @@ export async function handleOpenAiHttpRequest(
       });
       requestFinalize();
     } finally {
+      boundary.release();
       if (!closed) {
         emitAgentEvent({
           runId,
