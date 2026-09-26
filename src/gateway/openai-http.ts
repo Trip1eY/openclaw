@@ -11,7 +11,9 @@ import {
 import { isClientToolNameConflictError } from "../agents/agent-tool-definition-adapter.js";
 import type { AgentStreamParams, ClientToolDefinition } from "../agents/command/shared-types.js";
 import type { ImageContent } from "../agents/command/types.js";
+import { FailoverError } from "../agents/failover-error.js";
 import { registerM10GatewayRequest, type M10GatewayError } from "../agents/m10-gateway-boundary.js";
+import { normalizeAgentRunTimeoutPhase } from "../agents/run-timeout-attribution.js";
 import { STREAM_ERROR_FALLBACK_TEXT } from "../agents/stream-message-shared.js";
 import {
   hasNonzeroUsage,
@@ -727,6 +729,17 @@ function coerceRequest(val: unknown): OpenAiChatCompletionRequest {
   return val as OpenAiChatCompletionRequest;
 }
 
+/** The runner returns terminal timeouts normally after its retry budget is exhausted. */
+function assertNoTerminalTimeout(result: unknown): void {
+  const meta = (result as { meta?: { timeoutPhase?: unknown } } | null)?.meta;
+  // Command delivery preserves final timeout metadata but its JSON projection
+  // drops payload.isError. Prior attempt errors and aborted flags alone do not
+  // invalidate a recovered final reply.
+  if (normalizeAgentRunTimeoutPhase(meta?.timeoutPhase)) {
+    throw new FailoverError("upstream provider timeout", { reason: "timeout", status: 504 });
+  }
+}
+
 function resolveAgentResponseText(result: unknown): string {
   const payloads = (result as { payloads?: Array<{ text?: string }> } | null)?.payloads;
   if (!Array.isArray(payloads) || payloads.length === 0) {
@@ -888,7 +901,7 @@ function m10GatewayErrorPayload(error: M10GatewayError) {
   };
 }
 
-function m10CompatErrorPayload(mapped: OpenAiCompatError, requestId: string) {
+function m10CompatErrorPayload(mapped: OpenAiCompatError, requestId: string, partial = false) {
   return {
     request_id: requestId,
     detail: mapped.error.message,
@@ -898,7 +911,11 @@ function m10CompatErrorPayload(mapped: OpenAiCompatError, requestId: string) {
       layer: "openclaw",
       http_status: mapped.status,
       ...(mapped.status === 408 || mapped.status === 504
-        ? { category: "TIMEOUT", code: "OPENCLAW_TIMEOUT", retryable: true }
+        ? {
+            category: partial ? "STREAM_INTERRUPTED" : "TIMEOUT",
+            code: "OPENCLAW_TIMEOUT",
+            retryable: !partial,
+          }
         : {}),
     },
   };
@@ -1129,6 +1146,7 @@ export async function handleOpenAiHttpRequest(
         return true;
       }
 
+      assertNoTerminalTimeout(result);
       const usage = resolveChatCompletionUsage(result);
       const meta = (result as { meta?: unknown } | null)?.meta;
       const { stopReason, pendingToolCalls } = resolveStopReasonAndPendingToolCalls(meta);
@@ -1355,7 +1373,11 @@ export async function handleOpenAiHttpRequest(
         error: m10GatewayErrorPayload(error),
       });
     } else {
-      writeSse(res, { error: m10GatewayErrorPayload(error) });
+      writeSse(res, {
+        request_id: error.request_id,
+        detail: "upstream provider error",
+        error: m10GatewayErrorPayload(error),
+      });
       writeDone(res);
       res.end();
     }
@@ -1375,6 +1397,7 @@ export async function handleOpenAiHttpRequest(
         return;
       }
 
+      assertNoTerminalTimeout(result);
       finalUsage = resolveChatCompletionUsage(result);
       const meta = (result as { meta?: unknown } | null)?.meta;
       const { stopReason, pendingToolCalls } = resolveStopReasonAndPendingToolCalls(meta);
@@ -1483,7 +1506,12 @@ export async function handleOpenAiHttpRequest(
         closed = true;
         stopWatchingDisconnect();
         unsubscribe();
-        writeSse(res, { error: mapped.error });
+        writeSse(
+          res,
+          deferM10Headers || mapped.status === 408 || mapped.status === 504
+            ? m10CompatErrorPayload(mapped, boundary.requestId, sawAssistantDelta)
+            : { error: mapped.error },
+        );
         writeDone(res);
         res.end();
         return;

@@ -136,6 +136,123 @@ function firstAgentCommandOptions() {
 }
 
 describe("OpenAI-compatible HTTP API (e2e)", () => {
+  it("preserves partial content and terminates on a statusless Gateway SSE error", async () => {
+    agentCommand.mockImplementationOnce(async (input) => {
+      const runId = (input as { runId: string }).runId;
+      emitAgentEvent({ runId, stream: "assistant", data: { delta: "kept partial" } });
+      expect(
+        observeM10GatewayStreamError(
+          runId,
+          JSON.stringify({
+            layer: "gateway",
+            category: "STREAM_INTERRUPTED",
+            retryable: false,
+          }),
+        ),
+      ).toBe(true);
+      return { payloads: [{ text: "kept partial" }] } as never;
+    });
+    const response = await postChatCompletions(
+      enabledPort,
+      {
+        model: "openclaw",
+        stream: true,
+        messages: [{ role: "user", content: "test" }],
+      },
+      { "X-M10-Request-ID": "p04_gateway_partial" },
+    );
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const error = parseSseDataLines(body)
+      .filter((line) => line !== "[DONE]")
+      .map((line) => JSON.parse(line))
+      .find((frame) => frame.error);
+    expect(error).toMatchObject({
+      request_id: "p04_gateway_partial",
+      detail: "upstream provider error",
+      error: { category: "STREAM_INTERRUPTED", retryable: false },
+    });
+    expect(body).toContain("kept partial");
+    expect(body).not.toContain('"finish_reason":"stop"');
+  });
+
+  it.each([
+    { stream: false, m10: true, partial: false, status: 504 },
+    { stream: true, m10: true, partial: false, status: 504 },
+    { stream: true, m10: false, partial: false, status: 200 },
+    { stream: true, m10: true, partial: true, status: 200 },
+  ])(
+    "maps returned terminal timeout without emitting error prose ($stream/$m10/$partial)",
+    async ({ stream, m10, partial, status }) => {
+      agentCommand.mockClear();
+      agentCommand.mockImplementationOnce(async (input) => {
+        if (partial) {
+          emitAgentEvent({
+            runId: (input as { runId: string }).runId,
+            stream: "assistant",
+            data: { delta: "kept partial" },
+          });
+        }
+        return {
+          // deliverAgentCommandResult JSON projection omits the runner isError flag.
+          payloads: [{ text: "synthetic timeout explanation", mediaUrl: null }],
+          meta: { aborted: true, timeoutPhase: "provider", providerStarted: true },
+        } as never;
+      });
+      const response = await postChatCompletions(
+        enabledPort,
+        {
+          model: "openclaw",
+          stream,
+          messages: [{ role: "user", content: "test" }],
+        },
+        m10 ? { "X-M10-Request-ID": "p04_terminal_timeout" } : undefined,
+      );
+      expect(response.status).toBe(status);
+      const body = await response.text();
+      expect(body).not.toContain("synthetic timeout explanation");
+      const payload =
+        status === 200
+          ? parseSseDataLines(body)
+              .filter((line) => line !== "[DONE]")
+              .map((line) => JSON.parse(line))
+              .find((frame) => frame.error)
+          : JSON.parse(body);
+      expect(payload.error).toMatchObject({
+        category: partial ? "STREAM_INTERRUPTED" : "TIMEOUT",
+        retryable: !partial,
+        layer: "openclaw",
+      });
+      expect(payload.error.request_id).toBe(response.headers.get("x-m10-request-id"));
+      expect(payload.detail).toBeTruthy();
+      if (partial) expect(body).toContain("kept partial");
+      if (status === 200) expect(body).not.toContain('"finish_reason":"stop"');
+    },
+  );
+
+  it("accepts a successful final result after an earlier timeout", async () => {
+    agentCommand.mockResolvedValueOnce({
+      payloads: [{ text: "real recovered reply" }],
+      meta: {
+        aborted: true,
+        executionTrace: { attempts: [{ result: "timeout" }, { result: "success" }] },
+      },
+    } as never);
+    const response = await postChatCompletions(
+      enabledPort,
+      {
+        model: "openclaw",
+        stream: true,
+        messages: [{ role: "user", content: "test" }],
+      },
+      { "X-M10-Request-ID": "p04_recovered_timeout" },
+    );
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain("real recovered reply");
+    expect(body).not.toContain('"error":');
+  });
+
   it.each([
     { stream: false, status: 504 },
     { stream: true, status: 504 },
