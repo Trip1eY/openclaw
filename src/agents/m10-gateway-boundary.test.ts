@@ -56,4 +56,29 @@ describe("M10 Gateway request boundary", () => {
     expect(called).toBe(false);
     request.release();
   });
+
+  it("accepts the SDK statusless terminal Gateway SSE error without exposing raw fields", () => {
+    let observed: unknown;
+    const request = registerM10GatewayRequest("run-partial", "canary_partial_123", (error) => { observed = error; });
+    expect(observeM10GatewayStreamError("run-partial", JSON.stringify({
+      layer: "gateway", category: "STREAM_INTERRUPTED", code: "STREAM_INTERRUPTED",
+      retryable: false, provider: "fixture", model: "test", raw: "secret",
+    }))).toBe(true);
+    expect(observed).toEqual({
+      request_id: "canary_partial_123", category: "STREAM_INTERRUPTED", code: "STREAM_INTERRUPTED",
+      retryable: false, http_status: 502, provider: "fixture", model: "test",
+    });
+    request.release();
+  });
+
+  it.each([
+    { layer: "gateway", category: "TIMEOUT" },
+    { layer: "other", category: "STREAM_INTERRUPTED" },
+  ])("does not terminate on unrelated statusless errors: %j", (payload) => {
+    let called = false;
+    const request = registerM10GatewayRequest("run-unrelated", "canary_partial_123", () => { called = true; });
+    expect(observeM10GatewayStreamError("run-unrelated", JSON.stringify(payload))).toBe(false);
+    expect(called).toBe(false);
+    request.release();
+  });
 });

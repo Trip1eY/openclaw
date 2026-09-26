@@ -38,18 +38,19 @@ export function m10GatewayRequestId(runId: string): string | undefined {
   return active.get(runId)?.requestId;
 }
 
-/** The OpenAI SDK serializes a structured non-2xx Gateway error into errorMessage. */
+/** The SDK serializes Gateway HTTP errors and statusless terminal SSE errors differently. */
 export function observeM10GatewayStreamError(runId: string, errorMessage: unknown): boolean {
   const boundary = active.get(runId);
   if (!boundary || boundary.delivered || typeof errorMessage !== "string" || errorMessage.length > 4096) {
     return false;
   }
   const match = /^(\d{3})\s+(\{.*\})$/s.exec(errorMessage.trim());
-  if (!match) { return false; }
-  const status = Number(match[1]);
+  // SSE APIError has no HTTP status prefix. Only the Gateway's terminal partial
+  // category may use this path; unrelated statusless errors retain native handling.
+  const status = match ? Number(match[1]) : 502;
   if (status < 400 || status > 599) { return false; }
   let payload: unknown;
-  try { payload = JSON.parse(match[2]); } catch { return false; }
+  try { payload = JSON.parse(match ? match[2] : errorMessage.trim()); } catch { return false; }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) { return false; }
   const source = payload as Record<string, unknown>;
   const error = source.error;
@@ -57,6 +58,7 @@ export function observeM10GatewayStreamError(runId: string, errorMessage: unknow
     ? error as Record<string, unknown> : source;
   if (details.layer !== "gateway") { return false; }
   const category = details.category;
+  if (!match && category !== "STREAM_INTERRUPTED") { return false; }
   if (typeof category !== "string" || !CATEGORIES.has(category)) { return false; }
   const code = typeof details.code === "string" && CODE.test(details.code) ? details.code : category;
   const metadata: M10GatewayError = {
