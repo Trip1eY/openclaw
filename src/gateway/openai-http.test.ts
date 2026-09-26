@@ -136,12 +136,17 @@ function firstAgentCommandOptions() {
 }
 
 describe("OpenAI-compatible HTTP API (e2e)", () => {
-  it.each([false, true])(
-    "preserves an OpenClaw timeout before content (stream=%s)",
-    async (stream) => {
+  it.each([
+    { stream: false, status: 504 },
+    { stream: true, status: 504 },
+    { stream: false, status: 408 },
+    { stream: true, status: 408 },
+  ])(
+    "preserves an OpenClaw timeout before content ($stream/$status)",
+    async ({ stream, status }) => {
       agentCommand.mockClear();
       agentCommand.mockRejectedValueOnce(
-        new FailoverError("deadline expired", { reason: "timeout" }),
+        new FailoverError("deadline expired", { reason: "timeout", status }),
       );
       const response = await postChatCompletions(
         enabledPort,
@@ -152,7 +157,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         },
         { "X-M10-Request-ID": "canary_timeout_123" },
       );
-      expect(response.status).toBe(504);
+      expect(response.status).toBe(status);
       expect(response.headers.get("x-m10-request-id")).toBe("canary_timeout_123");
       expect(await response.json()).toMatchObject({
         request_id: "canary_timeout_123",
@@ -162,7 +167,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
           category: "TIMEOUT",
           code: "OPENCLAW_TIMEOUT",
           retryable: true,
-          http_status: 504,
+          http_status: status,
         },
       });
       expect(agentCommand).toHaveBeenCalledTimes(1);

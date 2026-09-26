@@ -897,7 +897,7 @@ function m10CompatErrorPayload(mapped: OpenAiCompatError, requestId: string) {
       request_id: requestId,
       layer: "openclaw",
       http_status: mapped.status,
-      ...(mapped.status === 504
+      ...(mapped.status === 408 || mapped.status === 504
         ? { category: "TIMEOUT", code: "OPENCLAW_TIMEOUT", retryable: true }
         : {}),
     },
