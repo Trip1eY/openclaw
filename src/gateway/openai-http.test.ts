@@ -136,6 +136,39 @@ function firstAgentCommandOptions() {
 }
 
 describe("OpenAI-compatible HTTP API (e2e)", () => {
+  it.each([false, true])(
+    "preserves an OpenClaw timeout before content (stream=%s)",
+    async (stream) => {
+      agentCommand.mockClear();
+      agentCommand.mockRejectedValueOnce(
+        new FailoverError("deadline expired", { reason: "timeout" }),
+      );
+      const response = await postChatCompletions(
+        enabledPort,
+        {
+          model: "openclaw",
+          messages: [{ role: "user", content: "test" }],
+          stream,
+        },
+        { "X-M10-Request-ID": "canary_timeout_123" },
+      );
+      expect(response.status).toBe(504);
+      expect(response.headers.get("x-m10-request-id")).toBe("canary_timeout_123");
+      expect(await response.json()).toMatchObject({
+        request_id: "canary_timeout_123",
+        detail: "upstream provider timeout",
+        error: {
+          layer: "openclaw",
+          category: "TIMEOUT",
+          code: "OPENCLAW_TIMEOUT",
+          retryable: true,
+          http_status: 504,
+        },
+      });
+      expect(agentCommand).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it.each([
     [502, "INVALID_RESPONSE"],
     [429, "RATE_LIMITED"],
@@ -171,7 +204,7 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
     expect(JSON.stringify(body)).not.toContain("secret");
   });
 
-  it("replaces an invalid M10 ID before it can reach the model", async () => {
+  it.each(["bad id!", "x".repeat(300), "B".repeat(80)])("validates M10 ID %s", async (rawId) => {
     agentCommand.mockClear();
     agentCommand.mockResolvedValueOnce({ payloads: [{ text: "ok" }] } as never);
     const response = await postChatCompletions(
@@ -180,10 +213,14 @@ describe("OpenAI-compatible HTTP API (e2e)", () => {
         model: "openclaw",
         messages: [{ role: "user", content: "test" }],
       },
-      { "X-M10-Request-ID": "bad id" },
+      { "X-M10-Request-ID": rawId },
     );
     expect(response.status).toBe(200);
-    expect(response.headers.get("x-m10-request-id")).toMatch(/^oc_[a-f0-9]{32}$/);
+    if (rawId.length === 80) {
+      expect(response.headers.get("x-m10-request-id")).toBe(rawId);
+    } else {
+      expect(response.headers.get("x-m10-request-id")).toMatch(/^oc_[a-f0-9]{32}$/);
+    }
     await response.text();
   });
 

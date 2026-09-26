@@ -65,7 +65,11 @@ import {
   resolveOpenAiCompatibleHttpOperatorScopes,
 } from "./http-utils.js";
 import { normalizeInputHostnameAllowlist } from "./input-allowlist.js";
-import { resolveOpenAiCompatError, validateOpenAiSamplingParams } from "./openai-compat-errors.js";
+import {
+  resolveOpenAiCompatError,
+  validateOpenAiSamplingParams,
+  type OpenAiCompatError,
+} from "./openai-compat-errors.js";
 import {
   isToolChoiceConstraintSatisfied,
   resolveUnsatisfiedToolChoiceMessage,
@@ -884,6 +888,22 @@ function m10GatewayErrorPayload(error: M10GatewayError) {
   };
 }
 
+function m10CompatErrorPayload(mapped: OpenAiCompatError, requestId: string) {
+  return {
+    request_id: requestId,
+    detail: mapped.error.message,
+    error: {
+      ...mapped.error,
+      request_id: requestId,
+      layer: "openclaw",
+      http_status: mapped.status,
+      ...(mapped.status === 504
+        ? { category: "TIMEOUT", code: "OPENCLAW_TIMEOUT", retryable: true }
+        : {}),
+    },
+  };
+}
+
 export async function handleOpenAiHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -915,6 +935,10 @@ export async function handleOpenAiHttpRequest(
   }
   const payload = coerceRequest(handled.body);
   const stream = Boolean(payload.stream);
+  const m10Request =
+    req.headers["x-m10-request-id"] !== undefined ||
+    (typeof req.headers["x-openclaw-model"] === "string" &&
+      req.headers["x-openclaw-model"].startsWith("m10-gateway/"));
   const streamIncludeUsage = stream && resolveIncludeUsageForStreaming(payload);
   const model = typeof payload.model === "string" ? payload.model : "openclaw";
   const user = typeof payload.user === "string" ? payload.user : undefined;
@@ -1183,7 +1207,11 @@ export async function handleOpenAiHttpRequest(
       }
       const mapped = resolveOpenAiCompatError(err);
       if (mapped) {
-        sendJson(res, mapped.status, { error: mapped.error });
+        sendJson(
+          res,
+          mapped.status,
+          m10Request ? m10CompatErrorPayload(mapped, boundary.requestId) : { error: mapped.error },
+        );
         return true;
       }
       sendJson(res, 500, {
@@ -1430,6 +1458,15 @@ export async function handleOpenAiHttpRequest(
         return;
       }
       logWarn(`openai-compat: streaming chat completion failed: ${String(err)}`);
+      const mapped = resolveOpenAiCompatError(err);
+      if (deferM10Headers && mapped && !res.headersSent) {
+        closed = true;
+        stopWatchingDisconnect();
+        unsubscribe();
+        sendJson(res, mapped.status, m10CompatErrorPayload(mapped, boundary.requestId));
+        abortController.abort();
+        return;
+      }
       startSse();
       if (isClientToolNameConflictError(err)) {
         closed = true;
@@ -1442,7 +1479,6 @@ export async function handleOpenAiHttpRequest(
         res.end();
         return;
       }
-      const mapped = resolveOpenAiCompatError(err);
       if (mapped) {
         closed = true;
         stopWatchingDisconnect();
