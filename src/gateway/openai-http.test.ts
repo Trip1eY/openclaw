@@ -11,7 +11,10 @@ import {
 } from "../agents/embedded-agent-subscribe.e2e-harness.js";
 import { subscribeEmbeddedAgentSession } from "../agents/embedded-agent-subscribe.js";
 import { FailoverError } from "../agents/failover-error.js";
-import { m10GatewayRequestId, observeM10GatewayStreamError } from "../agents/m10-gateway-boundary.js";
+import {
+  m10GatewayRequestId,
+  observeM10GatewayStreamError,
+} from "../agents/m10-gateway-boundary.js";
 import { HISTORY_CONTEXT_MARKER } from "../auto-reply/reply/history.js";
 import { CURRENT_MESSAGE_MARKER } from "../auto-reply/reply/mentions.js";
 import { resetConfigRuntimeState } from "../config/config.js";
@@ -133,29 +136,52 @@ function firstAgentCommandOptions() {
 }
 
 describe("OpenAI-compatible HTTP API (e2e)", () => {
-  it("keeps a validated M10 ID at ingress and returns safe Gateway category metadata", async () => {
+  it.each([
+    [502, "INVALID_RESPONSE"],
+    [429, "RATE_LIMITED"],
+    [502, "PROVIDER_5XX"],
+  ])("preserves pre-stream HTTP %s and %s with a validated M10 ID", async (status, category) => {
     agentCommand.mockClear();
     agentCommand.mockImplementationOnce(async (input) => {
       const runId = (input as { runId: string }).runId;
       expect(m10GatewayRequestId(runId)).toBe("canary_12345678");
-      observeM10GatewayStreamError(runId, '502 {"error":{"layer":"gateway","category":"INVALID_RESPONSE","code":"INVALID_RESPONSE","retryable":false,"raw":"secret"}}');
+      observeM10GatewayStreamError(
+        runId,
+        `${status} ${JSON.stringify({ error: { layer: "gateway", category, code: category, retryable: false, raw: "secret" } })}`,
+      );
       return { payloads: [] } as never;
     });
-    const response = await postChatCompletions(enabledPort, {
-      model: "openclaw", messages: [{ role: "user", content: "test" }], stream: true,
-    }, { "X-M10-Request-ID": "canary_12345678" });
+    const response = await postChatCompletions(
+      enabledPort,
+      {
+        model: "openclaw",
+        messages: [{ role: "user", content: "test" }],
+        stream: true,
+      },
+      { "X-M10-Request-ID": "canary_12345678" },
+    );
     expect(response.headers.get("x-m10-request-id")).toBe("canary_12345678");
-    const events = parseSseDataLines(await response.text());
-    expect(events.some((event) => event.includes('"category":"INVALID_RESPONSE"'))).toBe(true);
-    expect(events.join(" ")).not.toContain("secret");
+    expect(response.status).toBe(status);
+    const body = await response.json();
+    expect(body).toMatchObject({
+      request_id: "canary_12345678",
+      detail: "upstream provider error",
+      error: { category, http_status: status },
+    });
+    expect(JSON.stringify(body)).not.toContain("secret");
   });
 
   it("replaces an invalid M10 ID before it can reach the model", async () => {
     agentCommand.mockClear();
     agentCommand.mockResolvedValueOnce({ payloads: [{ text: "ok" }] } as never);
-    const response = await postChatCompletions(enabledPort, {
-      model: "openclaw", messages: [{ role: "user", content: "test" }],
-    }, { "X-M10-Request-ID": "bad id" });
+    const response = await postChatCompletions(
+      enabledPort,
+      {
+        model: "openclaw",
+        messages: [{ role: "user", content: "test" }],
+      },
+      { "X-M10-Request-ID": "bad id" },
+    );
     expect(response.status).toBe(200);
     expect(response.headers.get("x-m10-request-id")).toMatch(/^oc_[a-f0-9]{32}$/);
     await response.text();

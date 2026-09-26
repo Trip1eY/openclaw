@@ -7,7 +7,6 @@ import { ensureSystemPromptCacheBoundary } from "@openclaw/ai/internal/shared";
 import { MAX_IMAGE_BYTES } from "@openclaw/media-core/constants";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import { m10GatewayRequestId, observeM10GatewayStreamError } from "../../m10-gateway-boundary.js";
 import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
 import { buildHierarchyReinforcementMessage } from "../../../auto-reply/handoff-summarizer.js";
 import { filterHeartbeatTranscriptArtifacts } from "../../../auto-reply/heartbeat-filter.js";
@@ -189,6 +188,7 @@ import {
   resolveLocalModelLeanPreserveToolNames,
   shouldCatalogToolForLocalModelLean,
 } from "../../local-model-lean.js";
+import { m10GatewayRequestId, observeM10GatewayStreamError } from "../../m10-gateway-boundary.js";
 import { resolveModelAuthMode } from "../../model-auth.js";
 import { resolveDefaultModelForAgent } from "../../model-selection.js";
 import { supportsModelTools } from "../../model-tool-support.js";
@@ -507,7 +507,6 @@ import {
 import { resolveMessageMergeStrategy } from "./message-merge-strategy.js";
 import { installMessageToolOnlyTerminalHook } from "./message-tool-terminal.js";
 import { wrapStreamFnWithMessageTransform } from "./message-transform-stream-wrapper.js";
-import { wrapStreamObjectEvents } from "./stream-wrapper.js";
 import {
   MID_TURN_PRECHECK_ERROR_MESSAGE,
   isMidTurnPrecheckSignal,
@@ -526,6 +525,7 @@ import {
   buildRuntimeContextCustomMessage,
   resolveRuntimeContextPromptParts,
 } from "./runtime-context-prompt.js";
+import { wrapStreamObjectEvents } from "./stream-wrapper.js";
 import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
 
 type PreflightRecoveryBudgetSnapshot = Pick<
@@ -3277,11 +3277,21 @@ export async function runEmbeddedAttempt(
         const baseStreamFn = activeSession.agent.streamFn;
         activeSession.agent.streamFn = (model, context, options) => {
           const requestId = m10GatewayRequestId(params.runId);
-          const stream = baseStreamFn(model, context, requestId ? {
-            ...options,
-            headers: { ...options?.headers, "X-M10-Request-ID": requestId },
-          } : options);
-          if (requestId) {
+          const maybeStream = baseStreamFn(
+            model,
+            context,
+            requestId
+              ? {
+                  ...options,
+                  maxRetries: 0,
+                  headers: { ...options?.headers, "X-M10-Request-ID": requestId },
+                }
+              : options,
+          );
+          const observeStream = (stream: Awaited<typeof maybeStream>) => {
+            if (!requestId) {
+              return stream;
+            }
             wrapStreamObjectEvents(stream, (event) => {
               if (event.type === "error" && event.error && typeof event.error === "object") {
                 observeM10GatewayStreamError(
@@ -3290,8 +3300,12 @@ export async function runEmbeddedAttempt(
                 );
               }
             });
+            return stream;
+          };
+          if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
+            return Promise.resolve(maybeStream).then(observeStream);
           }
-          return stream;
+          return observeStream(maybeStream);
         };
       }
       let diagnosticModelCallSeq = 0;

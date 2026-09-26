@@ -142,6 +142,47 @@ function expectRecordFields(record: unknown, expected: Record<string, unknown>) 
 }
 
 describe("openai transport stream", () => {
+  it.each([429, 502])("honors disabled SDK retries for HTTP %s", async (status) => {
+    let calls = 0;
+    const server = createServer((_req, res) => {
+      calls += 1;
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { layer: "gateway", category: "INVALID_RESPONSE" } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Missing test listener");
+      }
+      const model = {
+        ...createDeepSeekCompletionsModel(),
+        provider: "m10-gateway",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      };
+      const stream = await createOpenAICompletionsTransportStreamFn()(
+        model,
+        {
+          messages: [{ role: "user", content: "fixture", timestamp: Date.now() }],
+          tools: [],
+        },
+        { apiKey: "fixture", maxRetries: 0 },
+      );
+      let errorSeen = false;
+      for await (const event of stream) {
+        if (event.type === "error") {
+          errorSeen = true;
+        }
+      }
+      expect(errorSeen).toBe(true);
+      expect(calls).toBe(1);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
   it("keeps bounded redacted diagnostics UTF-16 well-formed", () => {
     const payload = testing.stringifyRedactedPayload(`${"x".repeat(7_998)}🚀tail`);
     const event = testing.stringifyRedactedEvent(`${"x".repeat(1_998)}🚀tail`);

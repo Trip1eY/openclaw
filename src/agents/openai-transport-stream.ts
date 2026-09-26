@@ -2796,10 +2796,10 @@ export function createOpenAICompletionsTransportStreamFn(): StreamFn {
           options as OpenAICompletionsOptions | undefined,
         );
         firstEventAbort = createFirstStreamEventAbortController(options?.signal);
-        const responseStream = (await client.chat.completions.create(
-          params as never,
-          buildOpenAISdkRequestOptions(model, firstEventAbort.signal),
-        )) as unknown as AsyncIterable<ChatCompletionChunk>;
+        const responseStream = (await client.chat.completions.create(params as never, {
+          ...buildOpenAISdkRequestOptions(model, firstEventAbort.signal),
+          ...(options?.maxRetries !== undefined ? { maxRetries: options.maxRetries } : {}),
+        })) as unknown as AsyncIterable<ChatCompletionChunk>;
         stream.push({ type: "start", partial: output as never });
         await processOpenAICompletionsStream(responseStream, output, model, stream, {
           signal: options?.signal,

@@ -9,9 +9,9 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { isClientToolNameConflictError } from "../agents/agent-tool-definition-adapter.js";
-import { registerM10GatewayRequest, type M10GatewayError } from "../agents/m10-gateway-boundary.js";
 import type { AgentStreamParams, ClientToolDefinition } from "../agents/command/shared-types.js";
 import type { ImageContent } from "../agents/command/types.js";
+import { registerM10GatewayRequest, type M10GatewayError } from "../agents/m10-gateway-boundary.js";
 import { STREAM_ERROR_FALLBACK_TEXT } from "../agents/stream-message-shared.js";
 import {
   hasNonzeroUsage,
@@ -1207,6 +1207,17 @@ export async function handleOpenAiHttpRequest(
   let resultResolved = false;
   let closed = false;
   let stopWatchingDisconnect = () => {};
+  const deferM10Headers =
+    modelOverride?.startsWith("m10-gateway/") || req.headers["x-m10-request-id"] !== undefined;
+  const startSse = () => {
+    if (!res.headersSent) {
+      setSseHeaders(res);
+    }
+    if (!wroteRole) {
+      wroteRole = true;
+      writeAssistantRoleChunk(res, { runId, model });
+    }
+  };
 
   const maybeFinalize = () => {
     if (closed || !finalizeRequested) {
@@ -1222,6 +1233,7 @@ export async function handleOpenAiHttpRequest(
     stopWatchingDisconnect();
     unsubscribe();
     if (!wroteStopChunk) {
+      startSse();
       writeAssistantFinishChunk(res, { runId, model, finishReason: finalizeFinishReason });
       wroteStopChunk = true;
     }
@@ -1275,8 +1287,7 @@ export async function handleOpenAiHttpRequest(
       }
 
       if (!wroteRole) {
-        wroteRole = true;
-        writeAssistantRoleChunk(res, { runId, model });
+        startSse();
       }
 
       sawAssistantDelta = true;
@@ -1303,20 +1314,29 @@ export async function handleOpenAiHttpRequest(
   });
 
   const boundary = registerM10GatewayRequest(runId, req.headers["x-m10-request-id"], (error) => {
-    if (closed || res.writableEnded) { return; }
+    if (closed || res.writableEnded) {
+      return;
+    }
     closed = true;
     stopWatchingDisconnect();
     unsubscribe();
-    writeSse(res, { error: m10GatewayErrorPayload(error) });
-    writeDone(res);
-    res.end();
+    if (!res.headersSent) {
+      sendJson(res, error.http_status, {
+        request_id: error.request_id,
+        detail: "upstream provider error",
+        error: m10GatewayErrorPayload(error),
+      });
+    } else {
+      writeSse(res, { error: m10GatewayErrorPayload(error) });
+      writeDone(res);
+      res.end();
+    }
     abortController.abort();
   });
   res.setHeader("X-M10-Request-ID", boundary.requestId);
-  setSseHeaders(res);
-
-  wroteRole = true;
-  writeAssistantRoleChunk(res, { runId, model });
+  if (!deferM10Headers) {
+    startSse();
+  }
 
   void (async () => {
     try {
@@ -1344,6 +1364,7 @@ export async function handleOpenAiHttpRequest(
         closed = true;
         stopWatchingDisconnect();
         unsubscribe();
+        startSse();
         writeSse(res, {
           error: {
             message: resolveUnsatisfiedToolChoiceMessage(toolChoiceConstraint),
@@ -1357,8 +1378,7 @@ export async function handleOpenAiHttpRequest(
 
       if (stopReason === "tool_calls" && pendingToolCalls && pendingToolCalls.length > 0) {
         if (!wroteRole) {
-          wroteRole = true;
-          writeAssistantRoleChunk(res, { runId, model });
+          startSse();
         }
         if (!sawAssistantDelta) {
           const commentary =
@@ -1386,8 +1406,7 @@ export async function handleOpenAiHttpRequest(
 
       if (!sawAssistantDelta) {
         if (!wroteRole) {
-          wroteRole = true;
-          writeAssistantRoleChunk(res, { runId, model });
+          startSse();
         }
 
         const content =
@@ -1411,6 +1430,7 @@ export async function handleOpenAiHttpRequest(
         return;
       }
       logWarn(`openai-compat: streaming chat completion failed: ${String(err)}`);
+      startSse();
       if (isClientToolNameConflictError(err)) {
         closed = true;
         stopWatchingDisconnect();
