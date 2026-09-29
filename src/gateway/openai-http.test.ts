@@ -136,6 +136,38 @@ function firstAgentCommandOptions() {
 }
 
 describe("OpenAI-compatible HTTP API (e2e)", () => {
+  it("preserves post-header Gateway upstream 402 as a terminal error", async () => {
+    agentCommand.mockImplementationOnce(async (input) => {
+      const runId = (input as { runId: string }).runId;
+      emitAgentEvent({ runId, stream: "assistant", data: { delta: "kept partial" } });
+      expect(observeM10GatewayStreamError(runId, JSON.stringify({
+        request_id: "tel_0123456789abcdef",
+        error: {
+          layer: "gateway", category: "UPSTREAM_HTTP_ERROR", code: "UPSTREAM_HTTP_402",
+          upstream_status: 402, terminal: true, partial: true, retryable: false,
+          raw_body: "must-not-leak",
+        },
+      }))).toBe(true);
+      return { payloads: [{ text: "kept partial" }] } as never;
+    });
+    const response = await postChatCompletions(
+      enabledPort,
+      { model: "openclaw", stream: true, messages: [{ role: "user", content: "test" }] },
+      { "X-M10-Request-ID": "p041_gateway_402" },
+    );
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const error = parseSseDataLines(body).filter((line) => line !== "[DONE]")
+      .map((line) => JSON.parse(line)).find((frame) => frame.error);
+    expect(error).toMatchObject({
+      request_id: "p041_gateway_402",
+      error: { category: "UPSTREAM_HTTP_ERROR", http_status: 402, upstream_status: 402,
+               gateway_request_id: "tel_0123456789abcdef", partial: true },
+    });
+    expect(body).toContain("kept partial");
+    expect(body).not.toContain("must-not-leak");
+  });
+
   it("preserves partial content and terminates on a statusless Gateway SSE error", async () => {
     agentCommand.mockImplementationOnce(async (input) => {
       const runId = (input as { runId: string }).runId;

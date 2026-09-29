@@ -14,6 +14,7 @@ describe("M10 Gateway request boundary", () => {
     expect(errors).toEqual([{
       request_id: "canary_12345678", category: "INVALID_RESPONSE", code: "INVALID_RESPONSE",
       retryable: false, http_status: 502, provider: "fixture-provider",
+      gateway_request_id: "canary_12345678",
     }]);
     expect(observeM10GatewayStreamError("run-1", '502 {"error":{"layer":"gateway","category":"PROVIDER_5XX"}}')).toBe(false);
     request.release();
@@ -68,6 +69,47 @@ describe("M10 Gateway request boundary", () => {
       request_id: "canary_partial_123", category: "STREAM_INTERRUPTED", code: "STREAM_INTERRUPTED",
       retryable: false, http_status: 502, provider: "fixture", model: "test",
     });
+    request.release();
+  });
+
+  it("preserves terminal upstream HTTP 402 without calling it a timeout", () => {
+    let observed: unknown;
+    const request = registerM10GatewayRequest("run-402", "canary_87654321", (error) => { observed = error; });
+    expect(observeM10GatewayStreamError("run-402", JSON.stringify({
+      request_id: "tel_0123456789abcdef", detail: "upstream provider error",
+      error: {
+        layer: "gateway", category: "UPSTREAM_HTTP_ERROR", code: "UPSTREAM_HTTP_402",
+        upstream_status: 402, http_status: 402, terminal: true, partial: false,
+        raw_body: "must-not-leak",
+      },
+    }))).toBe(true);
+    expect(observed).toEqual({
+      request_id: "canary_87654321", gateway_request_id: "tel_0123456789abcdef",
+      category: "UPSTREAM_HTTP_ERROR", code: "UPSTREAM_HTTP_402",
+      upstream_status: 402, http_status: 402, retryable: false, terminal: true,
+    });
+    request.release();
+  });
+
+  it.each([
+    JSON.stringify({ layer: "gateway", category: "TIMEOUT", upstream_status: 402, terminal: true }),
+    '402 {"error":{"layer":"gateway","category":"TIMEOUT","terminal":true}}',
+  ])("normalizes a 402 mislabeled as timeout: %s", (message) => {
+    let observed: unknown;
+    const request = registerM10GatewayRequest("run-402-timeout", "canary_87654321", (error) => { observed = error; });
+    expect(observeM10GatewayStreamError("run-402-timeout", message)).toBe(true);
+    expect(observed).toMatchObject({ category: "UPSTREAM_HTTP_ERROR", code: "UPSTREAM_HTTP_402", http_status: 402 });
+    request.release();
+  });
+
+  it("accepts a terminal timeout only with transport timeout evidence", () => {
+    let observed: unknown;
+    const request = registerM10GatewayRequest("run-timeout", "canary_87654321", (error) => { observed = error; });
+    expect(observeM10GatewayStreamError("run-timeout", JSON.stringify({
+      layer: "gateway", category: "TIMEOUT", code: "TIMEOUT", terminal: true,
+      http_status: 504, upstream_status: null, timeout_source: "ReadTimeout",
+    }))).toBe(true);
+    expect(observed).toMatchObject({ category: "TIMEOUT", http_status: 504, timeout_source: "ReadTimeout" });
     request.release();
   });
 
